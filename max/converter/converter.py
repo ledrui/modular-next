@@ -39,7 +39,8 @@ class PyTorchToMAXConverter:
         """
         self.device = device or self._auto_detect_device()
         self.dtype = dtype or DType.float32
-        self.session = InferenceSession()
+        # Initialize session with proper device setup
+        self.session = self._create_inference_session()
         self.weight_arrays = {}  # Store actual weight data
         
         # Layer mapping registry
@@ -63,6 +64,23 @@ class PyTorchToMAXConverter:
         except:
             pass
         return DeviceRef.CPU()
+    
+    def _create_inference_session(self) -> InferenceSession:
+        """Create an InferenceSession with proper device setup."""
+        try:
+            from max.driver import CPU, Accelerator, accelerator_count
+            
+            devices = [CPU()]  # Always include CPU
+            
+            # Add accelerators if available
+            for i in range(accelerator_count()):
+                devices.append(Accelerator(i))
+                
+            return InferenceSession(devices=devices)
+        except:
+            # Fallback to CPU-only session
+            from max.driver import CPU
+            return InferenceSession(devices=[CPU()])
     
     def convert_model(self, 
                      pytorch_model: nn.Module,
