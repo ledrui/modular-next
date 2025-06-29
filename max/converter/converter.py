@@ -288,8 +288,10 @@ class PyTorchToMAXConverter:
         
         # Apply mean pooling: x.mean(dim=1) 
         # This reduces (batch, seq_len, embed_dim) to (batch, embed_dim)
-        x_mean = ops.mean(x, axis=1)  # Results in (batch, 1, embed_dim)
-        x_squeezed = ops.squeeze(x_mean, axis=1)  # Remove the singleton dim -> (batch, embed_dim)
+        # GPU reduction is limited to inner axis, so we transpose to make seq_len the last dimension
+        x_transposed = ops.transpose(x, 1, 2)  # (batch, seq_len, embed_dim) -> (batch, embed_dim, seq_len)
+        x_mean = ops.mean(x_transposed, axis=-1)  # Mean along last axis -> (batch, embed_dim, 1)
+        x_squeezed = ops.squeeze(x_mean, axis=-1)  # Remove the singleton dim -> (batch, embed_dim)
         
         x = self._convert_linear(linear, x_squeezed, graph)
         
