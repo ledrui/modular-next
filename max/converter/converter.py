@@ -8,6 +8,7 @@ that can be executed efficiently on MAX runtime.
 import sys
 import torch
 import torch.nn as nn
+import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List, Tuple
 import warnings
@@ -262,13 +263,74 @@ class PyTorchToMAXConverter:
             outputs = self._build_graph_from_weights(weights, graph.inputs, graph)
             graph.output(outputs)
         
-        # Load weights into graph
-        weights_registry = {
-            key: weight.allocate()
-            for key, weight in weights.items()
-        }
+        # Load weights into graph - convert to WeightData for dlpack compatibility
+        weights_registry = {}
+        for key, weight in weights.items():
+            try:
+                # Get the raw numpy array from the weight using allocate()
+                weight_data = weight.allocate()
+                
+                # Convert to numpy array
+                if isinstance(weight_data, np.ndarray):
+                    weight_array = weight_data
+                else:
+                    weight_array = np.array(weight_data)
+                
+                # Ensure it's a proper numpy array with standard dtype
+                if not isinstance(weight_array, np.ndarray):
+                    weight_array = np.array(weight_array)
+                
+                # Ensure contiguous memory layout
+                if not weight_array.flags['C_CONTIGUOUS']:
+                    weight_array = weight_array.copy()
+                
+                # Ensure compatible numpy dtype for MAX
+                if weight_array.dtype == np.object_ or str(weight_array.dtype) == 'object':
+                    # Try to infer the correct dtype from the data
+                    try:
+                        # Attempt to convert to float32 by default
+                        weight_array = weight_array.astype(np.float32)
+                    except (ValueError, TypeError):
+                        print(f"Warning: Skipping weight {key} with unsupported dtype: {weight_array.dtype}")
+                        continue
+                elif hasattr(weight_array.dtype, 'name'):
+                    # Convert to standard numpy dtype if needed
+                    if 'float32' in str(weight_array.dtype):
+                        weight_array = weight_array.astype(np.float32)
+                    elif 'float16' in str(weight_array.dtype):
+                        weight_array = weight_array.astype(np.float16)
+                    elif 'int' in str(weight_array.dtype):
+                        weight_array = weight_array.astype(np.int32)
+                    elif 'bool' in str(weight_array.dtype):
+                        weight_array = weight_array.astype(np.float32)
+                
+                # Create WeightData object
+                weights_registry[key] = WeightData.from_numpy(weight_array, key)
+                
+            except Exception as e:
+                print(f"Error processing weight {key}: {e}")
+                print(f"  Weight type: {type(weight)}")
+                if hasattr(weight, 'allocate'):
+                    try:
+                        allocated = weight.allocate()
+                        print(f"  Allocated type: {type(allocated)}")
+                        print(f"  Allocated dtype: {getattr(allocated, 'dtype', 'no dtype')}")
+                    except:
+                        print(f"  Could not allocate weight")
+                raise
         
-        return self.session.load(graph, weights_registry=weights_registry)
+        try:
+            return self.session.load(graph, weights_registry=weights_registry)
+        except Exception as e:
+            # Provide helpful error information
+            error_msg = str(e)
+            if "dlpack" in error_msg.lower():
+                print(f"DLPack error details in convert_from_checkpoint:")
+                print(f"  Number of weights: {len(weights_registry)}")
+                print(f"  Weight types: {set(type(w).__name__ for w in weights_registry.values())}")
+                print(f"  Sample weight names: {list(weights_registry.keys())[:5]}")
+                print(f"  Model path: {model_path}")
+            raise
     
     def _convert_module(self, module: nn.Module, inputs, graph) -> Any:
         """

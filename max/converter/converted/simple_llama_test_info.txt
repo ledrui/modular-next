@@ -1,0 +1,7 @@
+Model: simple_llama_test
+Source: simple_llama_test.pt
+Input shapes: [(1, 8)]
+Device: auto
+Data type: float32
+Input devices: [Device(type=cpu,id=0)]
+Output devices: [Device(type=cpu,id=0)]

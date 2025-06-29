@@ -79,6 +79,8 @@ Run comprehensive tests with multiple model types:
 
 ```bash
 pixi run python test_converter.py
+pixi run python simple_llama_test.py
+pixi pixi run  python cli.py convert simple_llama_test.pt --input-shapes "1,8" --output converted/ --verbose
 ```
 
 Tests include:
