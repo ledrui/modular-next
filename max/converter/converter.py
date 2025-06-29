@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 import warnings
 
 from max.graph import Graph, TensorType, ops, DeviceRef, Weight
-from max.graph.weights import PytorchWeights
+from max.graph.weights import PytorchWeights, SafetensorWeights
 from max.dtype import DType
 from max.engine import InferenceSession
 
@@ -106,7 +106,7 @@ class PyTorchToMAXConverter:
             pytorch_model: PyTorch model to convert
             input_shapes: List of input tensor shapes
             model_name: Name for the MAX graph
-            weights_path: Optional path to PyTorch weights file (.pt, .pth)
+            weights_path: Optional path to weights file (.pt, .pth, .safetensors, .bin)
             input_dtypes: Optional list of input data types. If None, uses self.dtype for all inputs.
                          Use DType.int64 for embedding inputs (token IDs).
             
@@ -161,7 +161,7 @@ class PyTorchToMAXConverter:
         Convert a PyTorch model directly from a checkpoint file.
         
         Args:
-            model_path: Path to PyTorch model file (.pt, .pth, .safetensors)
+            model_path: Path to model file (.pt, .pth, .safetensors, .bin)
             input_shapes: List of input tensor shapes
             model_name: Name for the MAX graph
             
@@ -176,8 +176,13 @@ class PyTorchToMAXConverter:
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
         
-        # Load PyTorch weights
-        weights = PytorchWeights(model_path)
+        # Load weights based on file format
+        if model_path.suffix in ['.pt', '.pth', '.bin']:
+            weights = PytorchWeights(model_path)
+        elif model_path.suffix == '.safetensors':
+            weights = SafetensorWeights([model_path])  # SafetensorWeights expects a sequence
+        else:
+            raise ValueError(f"Unsupported weight format: {model_path.suffix}. Supported formats: .pt, .pth, .safetensors, .bin")
         
         # Create input types
         input_types = [
@@ -935,11 +940,46 @@ class PyTorchToMAXConverter:
         """Load PyTorch weights from file."""
         weights_path = Path(weights_path)
         
-        if weights_path.suffix in ['.pt', '.pth']:
-            weights = PytorchWeights(weights_path)
-            return {key: weight.allocate() for key, weight in weights.items()}
-        else:
-            raise ValueError(f"Unsupported weight format: {weights_path.suffix}")
+        # Basic file validation
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Weights file not found: {weights_path}")
+        
+        if weights_path.stat().st_size == 0:
+            raise ValueError(f"Weights file is empty: {weights_path}")
+        
+        try:
+            if weights_path.suffix in ['.pt', '.pth']:
+                weights = PytorchWeights(weights_path)
+                return {key: weight.allocate() for key, weight in weights.items()}
+            elif weights_path.suffix == '.safetensors':
+                weights = SafetensorWeights([weights_path])  # SafetensorWeights expects a sequence
+                return {key: weight.allocate() for key, weight in weights.items()}
+            elif weights_path.suffix == '.bin':
+                # .bin files are typically PyTorch format as well
+                weights = PytorchWeights(weights_path)
+                return {key: weight.allocate() for key, weight in weights.items()}
+            else:
+                raise ValueError(f"Unsupported weight format: {weights_path.suffix}. Supported formats: .pt, .pth, .safetensors, .bin")
+        except Exception as e:
+            # Provide more helpful error messages for common issues
+            file_size = weights_path.stat().st_size
+            if "central directory" in str(e).lower() or "zip" in str(e).lower():
+                raise ValueError(
+                    f"Failed to load weights from {weights_path} (size: {file_size} bytes). "
+                    f"This usually indicates a corrupted or incomplete download. "
+                    f"Original error: {e}"
+                ) from e
+            elif "safetensors" in str(e).lower():
+                raise ValueError(
+                    f"Failed to load safetensors file {weights_path} (size: {file_size} bytes). "
+                    f"Make sure the file is a valid safetensors format. "
+                    f"Original error: {e}"
+                ) from e
+            else:
+                raise ValueError(
+                    f"Failed to load weights from {weights_path} (size: {file_size} bytes). "
+                    f"Original error: {e}"
+                ) from e
     
     def _extract_state_dict(self, model: nn.Module) -> Dict[str, Any]:
         """Extract state dict from PyTorch model."""
@@ -955,7 +995,7 @@ class PyTorchToMAXConverter:
             
         return weights_registry
     
-    def _build_graph_from_weights(self, weights: PytorchWeights, inputs, graph) -> Any:
+    def _build_graph_from_weights(self, weights: Union[PytorchWeights, SafetensorWeights], inputs, graph) -> Any:
         """Build MAX graph by analyzing weight structure."""
         # This is a placeholder for weight-based graph construction
         # In practice, you'd analyze the weight names and shapes to 
