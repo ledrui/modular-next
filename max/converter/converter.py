@@ -53,6 +53,12 @@ class PyTorchToMAXConverter:
             nn.GELU: self._convert_gelu,
             nn.Dropout: self._convert_dropout,
             nn.MultiheadAttention: self._convert_attention,
+            nn.Flatten: self._convert_flatten,
+        }
+        
+        # Special case handlers for known model patterns
+        self.special_converters = {
+            'SimpleTransformer': self._convert_simple_transformer,
         }
         
     def _auto_detect_device(self) -> DeviceRef:
@@ -86,7 +92,8 @@ class PyTorchToMAXConverter:
                      pytorch_model: nn.Module,
                      input_shapes: List[Tuple[int, ...]],
                      model_name: str = "converted_model",
-                     weights_path: Optional[Union[str, Path]] = None) -> Any:
+                     weights_path: Optional[Union[str, Path]] = None,
+                     input_dtypes: Optional[List[DType]] = None) -> Any:
         """
         Convert a PyTorch model to MAX format.
         
@@ -95,6 +102,8 @@ class PyTorchToMAXConverter:
             input_shapes: List of input tensor shapes
             model_name: Name for the MAX graph
             weights_path: Optional path to PyTorch weights file (.pt, .pth)
+            input_dtypes: Optional list of input data types. If None, uses self.dtype for all inputs.
+                         Use DType.int64 for embedding inputs (token IDs).
             
         Returns:
             Compiled MAX model ready for inference
@@ -104,10 +113,18 @@ class PyTorchToMAXConverter:
         self.weight_arrays.clear()
         
         # Create input types for MAX graph
-        input_types = [
-            TensorType(self.dtype, shape, device=self.device) 
-            for shape in input_shapes
-        ]
+        if input_dtypes is None:
+            input_types = [
+                TensorType(self.dtype, shape, device=self.device) 
+                for shape in input_shapes
+            ]
+        else:
+            if len(input_dtypes) != len(input_shapes):
+                raise ValueError(f"Number of input_dtypes ({len(input_dtypes)}) must match number of input_shapes ({len(input_shapes)})")
+            input_types = [
+                TensorType(dtype, shape, device=self.device) 
+                for dtype, shape in zip(input_dtypes, input_shapes)
+            ]
         
         # Build MAX graph
         with Graph(model_name, input_types=input_types) as graph:
@@ -216,6 +233,11 @@ class PyTorchToMAXConverter:
     
     def _convert_generic_module(self, module: nn.Module, inputs, graph) -> Any:
         """Attempt to convert a generic module by analyzing its structure."""
+        # Check for special converters first
+        class_name = type(module).__name__
+        if class_name in self.special_converters:
+            return self.special_converters[class_name](module, inputs, graph)
+            
         # For custom modules, try to convert child modules
         if hasattr(module, 'forward'):
             # This is a simplified approach - in practice, you'd need
@@ -227,6 +249,50 @@ class PyTorchToMAXConverter:
         for name, child in module.named_children():
             if hasattr(child, 'forward'):
                 x = self._convert_module(child, x, graph)
+        return x
+    
+    def _convert_simple_transformer(self, module: nn.Module, inputs, graph) -> Any:
+        """Convert SimpleTransformer module with proper mean pooling."""
+        # Handle the SimpleTransformer forward pass:
+        # x = self.embedding(x)
+        # x = self.layer_norm(x)  
+        # x = x.mean(dim=1)  # Global average pooling
+        # x = self.linear(x)
+        
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"SimpleTransformer expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get the child modules
+        embedding = None
+        layer_norm = None 
+        linear = None
+        
+        for name, child in module.named_children():
+            if isinstance(child, nn.Embedding):
+                embedding = child
+            elif isinstance(child, nn.LayerNorm):
+                layer_norm = child
+            elif isinstance(child, nn.Linear):
+                linear = child
+                
+        if not all([embedding, layer_norm, linear]):
+            raise ValueError("SimpleTransformer requires embedding, layer_norm, and linear modules")
+        
+        # Apply the layers in sequence with mean pooling
+        x = self._convert_embedding(embedding, x, graph)
+        x = self._convert_layernorm(layer_norm, x, graph)
+        
+        # Apply mean pooling: x.mean(dim=1) 
+        # This reduces (batch, seq_len, embed_dim) to (batch, embed_dim)
+        x_mean = ops.mean(x, axis=1)  # Results in (batch, 1, embed_dim)
+        x_squeezed = ops.squeeze(x_mean, axis=1)  # Remove the singleton dim -> (batch, embed_dim)
+        
+        x = self._convert_linear(linear, x_squeezed, graph)
+        
         return x
     
     # Layer-specific conversion methods
@@ -364,9 +430,17 @@ class PyTorchToMAXConverter:
         else:
             x = inputs
             
+        # Convert input from NCHW to NHWC format
+        # PyTorch uses NCHW: (batch, channels, height, width)
+        # MAX expects NHWC: (batch, height, width, channels)
+        x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+            
         # Create Weight object for convolution parameters
         weight_name = f"conv2d_weight_{id(layer)}"
-        weight_array = layer.weight.detach().cpu().numpy()
+        # Convert PyTorch weight format (OIHW) to MAX format (HWIO)
+        # PyTorch: (out_channels, in_channels, height, width)
+        # MAX: (height, width, in_channels, out_channels)
+        weight_array = layer.weight.detach().cpu().numpy().transpose(2, 3, 1, 0)
         # Ensure contiguous memory layout (required by MAX)
         if not weight_array.flags['C_CONTIGUOUS']:
             weight_array = weight_array.copy()
@@ -387,15 +461,15 @@ class PyTorchToMAXConverter:
             layer.padding[1], layer.padding[1]   # width padding
         )
         
-        # Convolution operation
+        # Convolution operation (input is now in NHWC format)
         output = ops.conv2d(
-            x.tensor, weight, 
+            x_nhwc, weight, 
             stride=layer.stride,
             dilation=layer.dilation,
             padding=padding
         )
         
-        # Add bias if present
+        # Add bias if present (while output is still in NHWC format)
         if layer.bias is not None:
             bias_name = f"conv2d_bias_{id(layer)}"
             bias_array = layer.bias.detach().cpu().numpy()
@@ -412,6 +486,9 @@ class PyTorchToMAXConverter:
             self.weight_arrays[bias_name] = bias_array
             bias = graph.add_weight(bias_weight)
             output = ops.add(output, bias)
+        
+        # Convert output back from NHWC to NCHW to match PyTorch convention
+        output = ops.permute(output, [0, 3, 1, 2])  # NHWC -> NCHW
             
         return output
     
@@ -450,6 +527,29 @@ class PyTorchToMAXConverter:
             return inputs[0] if len(inputs) == 1 else inputs
         else:
             return inputs
+    
+    def _convert_flatten(self, layer: nn.Flatten, inputs, graph) -> Any:
+        """Convert nn.Flatten to MAX operations."""
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"Flatten expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get flatten parameters
+        start_dim = getattr(layer, 'start_dim', 1)
+        end_dim = getattr(layer, 'end_dim', -1)
+        
+        # For most cases, flatten just flattens from start_dim onwards
+        # We'll implement the most common case: flatten everything except batch dimension
+        if start_dim == 1 and end_dim == -1:
+            # Flatten all dimensions except the first (batch) dimension
+            # This is equivalent to x.view(batch_size, -1)
+            return ops.flatten(x.tensor, start_dim=1)
+        else:
+            # For more complex flatten operations, use the provided parameters
+            return ops.flatten(x.tensor, start_dim=start_dim, end_dim=end_dim)
     
     def _convert_attention(self, layer: nn.MultiheadAttention, inputs, graph) -> Any:
         """Convert nn.MultiheadAttention to MAX operations."""
@@ -533,7 +633,8 @@ def convert_pytorch_model(model: nn.Module,
                          input_shapes: List[Tuple[int, ...]],
                          device: Optional[DeviceRef] = None,
                          dtype: Optional[DType] = None,
-                         model_name: str = "converted_model") -> Any:
+                         model_name: str = "converted_model",
+                         input_dtypes: Optional[List[DType]] = None) -> Any:
     """
     Quick conversion function for PyTorch models.
     
@@ -543,12 +644,14 @@ def convert_pytorch_model(model: nn.Module,
         device: Target device (auto-detected if None)
         dtype: Target data type (float32 if None)
         model_name: Name for the MAX graph
+        input_dtypes: Optional list of input data types. If None, uses dtype for all inputs.
+                     Use DType.int64 for embedding inputs (token IDs).
         
     Returns:
         Compiled MAX model
     """
     converter = PyTorchToMAXConverter(device=device, dtype=dtype)
-    return converter.convert_model(model, input_shapes, model_name)
+    return converter.convert_model(model, input_shapes, model_name, weights_path=None, input_dtypes=input_dtypes)
 
 
 def convert_from_checkpoint(model_path: Union[str, Path],

@@ -98,11 +98,17 @@ def test_model_conversion(model_name, pytorch_model, input_shapes, device=None, 
         print("\nConverting PyTorch model to MAX...")
         start_time = time.time()
         
+        # Determine input dtypes - use int64 for transformer models with embedding
+        input_dtypes = None
+        if model_name == 'transformer':
+            input_dtypes = [DType.int64]  # Transformer expects integer token IDs
+        
         converter = PyTorchToMAXConverter(device=device, dtype=dtype)
         max_model = converter.convert_model(
             pytorch_model, 
             input_shapes, 
-            model_name=f"{model_name}_converted"
+            model_name=f"{model_name}_converted",
+            input_dtypes=input_dtypes
         )
         
         conversion_time = time.time() - start_time
@@ -134,12 +140,18 @@ def test_model_conversion(model_name, pytorch_model, input_shapes, device=None, 
     try:
         print("\nRunning MAX inference...")
         
-        # Convert input to MAX tensor
+        # Convert input to MAX tensor 
+        if model_name == 'transformer':
+            # For transformer, ensure input is int64
+            test_input_for_max = test_input_np.astype(np.int64)
+        else:
+            test_input_for_max = test_input_np.astype(np.float32)
+            
         if len(max_model.input_devices) > 0:
             target_device = max_model.input_devices[0]
-            max_input = Tensor.from_numpy(test_input_np).to(target_device)
+            max_input = Tensor.from_numpy(test_input_for_max).to(target_device)
         else:
-            max_input = Tensor.from_numpy(test_input_np)
+            max_input = Tensor.from_numpy(test_input_for_max)
         
         start_time = time.time()
         max_output = max_model.execute(max_input)
