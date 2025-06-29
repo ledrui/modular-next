@@ -116,6 +116,92 @@ Examples include:
 | `nn.Conv2d` | `ops.conv2d` | ✅ |
 | `nn.Dropout` | Identity (inference) | ✅ |
 | `nn.MultiheadAttention` | Simplified | 🚧 |
+| `nn.SiLU` | `ops.silu` (with fallback) | ✅ |
+| `nn.BatchNorm2d` | `ops.batch_norm` | ✅ |
+| `nn.MaxPool2d` | `ops.max_pool2d` | ✅ |
+| `nn.AvgPool2d` | `ops.avg_pool2d` | ✅ |
+| `nn.AdaptiveAvgPool2d` | `ops.avg_pool2d` | ✅ |
+
+## Llama Model Support 🦙
+
+The converter now includes **experimental support for Llama models** with native MAX operations:
+
+### Supported Llama Components
+
+| Component | Implementation | Status |
+|-----------|----------------|--------|
+| **RMSNorm** | Manual implementation with MAX ops | ✅ |
+| **SiLU Activation** | `ops.silu` with fallback | ✅ |
+| **SwiGLU MLP** | `down_proj(SiLU(gate_proj(x)) * up_proj(x))` | ✅ |
+| **LlamaAttention** | Simplified (no RoPE/GQA) | 🚧 |
+| **LlamaDecoderLayer** | Full residual connections | ✅ |
+| **LlamaForCausalLM** | Complete architecture | ✅ |
+
+### Testing with Sample Models
+
+We provide sample Llama models for testing the converter:
+
+#### Option 1: Full Llama Architecture
+```bash
+# Create a complete Llama model with proper components
+pixi run python create_sample_llama.py
+
+# Convert to MAX
+python cli.py convert sample_llama.pt --input-shapes "1,10" --output converted/ --verbose
+```
+
+#### Option 2: Simple Test Model
+```bash
+# Create a simplified Llama-like model for quick testing
+pixi run python simple_llama_test.py
+
+# Convert to MAX
+python cli.py convert simple_llama_test.pt --input-shapes "1,8" --output converted/ --verbose
+```
+
+### What's Included in Sample Models
+
+**Full Llama Model (`create_sample_llama.py`):**
+- ✅ Custom `RMSNorm` implementation
+- ✅ `LlamaMLP` with SwiGLU activation
+- ✅ `LlamaAttention` (simplified, no RoPE)
+- ✅ `LlamaDecoderLayer` with residual connections
+- ✅ Complete `LlamaForCausalLM` architecture
+- 📊 Small size: ~1K vocab, 256 hidden, 2 layers
+
+**Simple Test Model (`simple_llama_test.py`):**
+- ✅ Basic embedding + linear layers
+- ✅ SiLU activation
+- ✅ LayerNorm (as RMSNorm substitute)
+- ✅ Residual connections
+- 📊 Tiny size: 100 vocab, 64 hidden, 1 layer
+
+### Real Llama Model Conversion
+
+To convert actual Llama models from Hugging Face:
+
+```bash
+# Download Llama model
+python cli.py download meta-llama/Llama-2-7b-hf --output downloads/
+
+# Convert to MAX (experimental)
+python cli.py convert downloads/llama_2_7b_hf.safetensors --input-shapes "1,512" --output converted/ --verbose
+```
+
+### Current Limitations
+
+- **RoPE (Rotary Position Embedding)**: Not implemented - uses simplified attention
+- **Grouped Query Attention**: Falls back to standard multi-head attention
+- **KV Caching**: Not implemented - affects inference efficiency
+- **Attention Masking**: Basic implementation
+
+### Expected Results
+
+The converter should successfully handle:
+- ✅ Basic text generation tasks
+- ✅ Model architecture conversion
+- ✅ Weight loading and format conversion
+- ⚠️ May have reduced accuracy for complex tasks due to simplified attention
 
 ## Requirements
 
