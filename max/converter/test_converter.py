@@ -67,42 +67,34 @@ def create_test_models():
     class SimpleResNet(nn.Module):
         def __init__(self, num_classes=10):
             super().__init__()
-            # Initial convolution
-            self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            self.bn1 = nn.BatchNorm2d(64)
-            self.relu = nn.ReLU(inplace=True)
-            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            # Simple CNN without adaptive pooling
+            self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
+            self.relu1 = nn.ReLU()
+            self.pool1 = nn.MaxPool2d(2, 2)  # 224x224 -> 112x112
             
-            # Simplified residual block (without skip connections for now)
-            self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            self.bn2 = nn.BatchNorm2d(64)
-            self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False)
-            self.bn3 = nn.BatchNorm2d(128)
+            self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+            self.relu2 = nn.ReLU() 
+            self.pool2 = nn.MaxPool2d(2, 2)  # 112x112 -> 56x56
             
-            # Global average pooling and classifier
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-            self.fc = nn.Linear(128, num_classes)
+            self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+            self.relu3 = nn.ReLU()
+            self.pool3 = nn.MaxPool2d(2, 2)  # 56x56 -> 28x28
+            
+            # Calculate the flattened size: 128 * 28 * 28 = 100352
+            self.fc1 = nn.Linear(128 * 28 * 28, 256)
+            self.relu4 = nn.ReLU()
+            self.fc2 = nn.Linear(256, num_classes)
             
         def forward(self, x):
-            # Initial conv block
-            x = self.conv1(x)
-            x = self.bn1(x)
-            x = self.relu(x)
-            x = self.maxpool(x)
+            x = self.pool1(self.relu1(self.conv1(x)))
+            x = self.pool2(self.relu2(self.conv2(x)))
+            x = self.pool3(self.relu3(self.conv3(x)))
             
-            # Simplified residual blocks (without skip connections)
-            x = self.conv2(x)
-            x = self.bn2(x)
-            x = self.relu(x)
+            # Flatten manually with explicit dimensions
+            x = x.view(x.size(0), -1)  # Should be [batch_size, 128*28*28]
             
-            x = self.conv3(x)
-            x = self.bn3(x)
-            x = self.relu(x)
-            
-            # Global average pooling and classifier
-            x = self.avgpool(x)
-            x = torch.flatten(x, 1)
-            x = self.fc(x)
+            x = self.relu4(self.fc1(x))
+            x = self.fc2(x)
             
             return x
     

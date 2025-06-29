@@ -159,10 +159,24 @@ def cmd_download(args):
         model_path = download_hf_model(model_id, cache_dir=args.hf_cache_dir)
         print(f"✅ Model downloaded to: {model_path}")
         
-        # If output directory specified, show how to convert
+        # If output directory specified, copy the model there
         if args.output:
+            import shutil
+            output_dir = Path(args.output)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create a clean filename from model_id
+            clean_name = model_id.replace('/', '_').replace('-', '_')
+            output_file = output_dir / f"{clean_name}{model_path.suffix}"
+            
+            print(f"Copying model to output directory: {output_file}")
+            shutil.copy2(model_path, output_file)
+            
             print(f"\nTo convert this model, run:")
-            print(f"python cli.py convert {model_path} --input-shapes \"<your_shapes>\" --output {args.output}")
+            print(f"python cli.py convert {output_file} --input-shapes \"<your_shapes>\" --output converted/")
+        else:
+            print(f"\nTo convert this model, run:")
+            print(f"python cli.py convert {model_path} --input-shapes \"<your_shapes>\" --output converted/")
         
     except Exception as e:
         print(f"❌ Failed to download model: {e}")
