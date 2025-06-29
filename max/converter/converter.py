@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional, Union, List, Tuple
 import warnings
 
 from max.graph import Graph, TensorType, ops, DeviceRef, Weight
-from max.graph.weights import PytorchWeights, SafetensorWeights
+from max.graph.weights import PytorchWeights, SafetensorWeights, WeightData
 from max.dtype import DType
 from max.engine import InferenceSession
 
@@ -190,7 +190,12 @@ class PyTorchToMAXConverter:
                 graph.output(outputs)
         
         # Load weights if provided or use extracted weights
-        weights_registry = self.weight_arrays.copy()  # Use collected weight arrays
+        weights_registry = {}
+        
+        # Convert raw numpy arrays to WeightData objects for dlpack compatibility
+        for weight_name, weight_array in self.weight_arrays.items():
+            weights_registry[weight_name] = WeightData.from_numpy(weight_array, weight_name)
+        
         if weights_path:
             # If external weights provided, update registry
             external_weights = self._load_pytorch_weights(weights_path)
@@ -630,27 +635,25 @@ class PyTorchToMAXConverter:
         scale = graph.add_weight(weight)
         
         # RMSNorm: x * scale / sqrt(mean(x^2) + eps)
-        # Check if MAX has native RMSNorm, otherwise implement manually
-        try:
-            return ops.rms_norm(x.tensor, scale, epsilon=eps)
-        except AttributeError:
-            # Fallback: implement RMSNorm manually
-            # 1. Compute x^2
-            x_squared = ops.mul(x.tensor, x.tensor)
-            
-            # 2. Compute mean along last dimension
-            mean_x_squared = ops.mean(x_squared, axis=-1, keepdims=True)
-            
-            # 3. Add epsilon and sqrt
-            eps_const = ops.constant(eps, dtype=self.dtype, device=self.device)
-            variance = ops.add(mean_x_squared, eps_const)
-            rms = ops.sqrt(variance)
-            
-            # 4. Normalize
-            normalized = ops.div(x.tensor, rms)
-            
-            # 5. Scale
-            return ops.mul(normalized, scale)
+        # Implement RMSNorm manually since ops.rms_norm may not be available
+        # 1. Compute x^2
+        x_squared = ops.mul(x.tensor, x.tensor)
+        
+        # 2. Compute mean along last dimension
+        mean_x_squared = ops.mean(x_squared, axis=-1)
+        # Add back the dimension that was removed by mean for broadcasting
+        mean_x_squared = ops.unsqueeze(mean_x_squared, axis=-1)
+        
+        # 3. Add epsilon and sqrt  
+        eps_const = ops.constant(eps, dtype=self.dtype, device=self.device)
+        variance = ops.add(mean_x_squared, eps_const)
+        rms = ops.sqrt(variance)
+        
+        # 4. Normalize
+        normalized = ops.div(x.tensor, rms)
+        
+        # 5. Scale
+        return ops.mul(normalized, scale)
     
     def _convert_conv2d(self, layer: nn.Conv2d, inputs, graph) -> Any:
         """Convert nn.Conv2d to MAX operations."""
