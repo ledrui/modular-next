@@ -2,10 +2,19 @@
 
 ## Basic Usage
 
-Convert a PyTorch model to MAX format:
-
+### Convert a local PyTorch model to MAX format:
 ```bash
 python cli.py /path/to/model.pt --input-shapes "1,784"
+```
+
+### Download and convert a Hugging Face model:
+```bash
+python cli.py microsoft/DialoGPT-medium --input-shapes "1,512"
+```
+
+### Download only (without conversion):
+```bash
+python cli.py microsoft/DialoGPT-medium --download-only
 ```
 
 ## Command Line Arguments
@@ -13,7 +22,10 @@ python cli.py /path/to/model.pt --input-shapes "1,784"
 ### Required Arguments
 
 - `model_path`: Path to PyTorch model file (.pt, .pth, .safetensors) or Hugging Face model URL/ID
-- `--input-shapes`: Input tensor shapes in format 'batch,dim1,dim2,...'
+
+### Conditionally Required Arguments
+
+- `--input-shapes`: Input tensor shapes in format 'batch,dim1,dim2,...' (required for conversion, not needed with --download-only)
 
 ### Optional Arguments
 
@@ -23,6 +35,7 @@ python cli.py /path/to/model.pt --input-shapes "1,784"
 - `--dtype`: Target data type - float32, float16, int8, int32, int64 (default: float32)
 - `--verbose, -v`: Enable verbose output
 - `--hf-cache-dir`: Cache directory for Hugging Face models (default: system temp directory)
+- `--download-only`: Only download the model without converting (HF models only)
 
 ## Examples
 
@@ -66,6 +79,23 @@ python cli.py openai/gpt-2 --input-shapes "1,1024" --hf-cache-dir ./hf_cache --o
 #### Large language model
 ```bash
 python cli.py microsoft/DialoGPT-large --input-shapes "1,1024" --device gpu --dtype float16
+```
+
+### Download Only (No Conversion)
+
+#### Download model to inspect before conversion
+```bash
+python cli.py microsoft/DialoGPT-medium --download-only --output downloads/
+```
+
+#### Download with custom cache
+```bash
+python cli.py bert-base-uncased --download-only --hf-cache-dir ./my_cache/
+```
+
+#### Download large model to verify it works
+```bash
+python cli.py facebook/opt-1.3b --download-only --verbose
 ```
 
 ## Output
