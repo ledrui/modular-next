@@ -1,101 +1,117 @@
 # CLI Usage Guide
 
+## Overview
+
+The CLI now uses subcommands for better separation of concerns:
+- `convert`: Convert local PyTorch models to MAX format
+- `download`: Download models from Hugging Face Hub
+
 ## Basic Usage
 
 ### Convert a local PyTorch model to MAX format:
 ```bash
-python cli.py /path/to/model.pt --input-shapes "1,784"
+python cli.py convert /path/to/model.pt --input-shapes "1,784"
 ```
 
-### Download and convert a Hugging Face model:
+### Download a Hugging Face model:
 ```bash
-python cli.py microsoft/DialoGPT-medium --input-shapes "1,512"
+python cli.py download microsoft/DialoGPT-medium --output downloads/
 ```
 
-### Download only (without conversion):
+### Two-step workflow (recommended):
 ```bash
-python cli.py microsoft/DialoGPT-medium --download-only
+# Step 1: Download
+python cli.py download bert-base-uncased --output downloads/
+
+# Step 2: Convert  
+python cli.py convert downloads/model.safetensors --input-shapes "1,512" --output converted/
 ```
 
-## Command Line Arguments
+## Commands
 
-### Required Arguments
+### `convert` - Convert PyTorch model to MAX format
 
-- `model_path`: Path to PyTorch model file (.pt, .pth, .safetensors) or Hugging Face model URL/ID
+**Required Arguments:**
+- `model_path`: Path to PyTorch model file (.pt, .pth, .safetensors, .bin)
+- `--input-shapes`: Input tensor shapes in format 'batch,dim1,dim2,...' or 'batch,dim1;batch,dim2' for multiple inputs
 
-### Conditionally Required Arguments
-
-- `--input-shapes`: Input tensor shapes in format 'batch,dim1,dim2,...' (required for conversion, not needed with --download-only)
-
-### Optional Arguments
-
+**Optional Arguments:**
 - `--output, -o`: Output directory (default: models)
-- `--model-name`: Name for the converted model (default: derived from filename or HF model ID)
+- `--model-name`: Name for the converted model (default: derived from filename)
 - `--device`: Target device - cpu, gpu, or auto (default: auto)
 - `--dtype`: Target data type - float32, float16, int8, int32, int64 (default: float32)
 - `--verbose, -v`: Enable verbose output
+
+### `download` - Download model from Hugging Face
+
+**Required Arguments:**
+- `model_path`: Hugging Face model URL/ID (e.g., microsoft/DialoGPT-medium)
+
+**Optional Arguments:**
+- `--output, -o`: Output directory for downloaded model
 - `--hf-cache-dir`: Cache directory for Hugging Face models (default: system temp directory)
-- `--download-only`: Only download the model without converting (HF models only)
+- `--verbose, -v`: Enable verbose output
 
 ## Examples
 
-### Simple Linear Model
+### Convert Local Models
+
+#### Simple Linear Model
 ```bash
-python cli.py model.pt --input-shapes "1,784" --output models/
+python cli.py convert model.pt --input-shapes "1,784" --output models/
 ```
 
-### CNN Model with GPU
+#### CNN Model with GPU
 ```bash
-python cli.py resnet.pth --input-shapes "1,3,224,224" --device gpu --output converted/
+python cli.py convert resnet.pth --input-shapes "1,3,224,224" --device gpu --output converted/
 ```
 
-### Multiple Inputs
+#### Multiple Inputs
 ```bash
-python cli.py multimodal.pt --input-shapes "1,768;1,10" --verbose
+python cli.py convert multimodal.pt --input-shapes "1,768;1,10" --verbose
 ```
 
-### Different Data Types
+#### Different Data Types
 ```bash
-python cli.py quantized.pt --input-shapes "32,512" --dtype float16 --model-name fast_model
+python cli.py convert quantized.pt --input-shapes "32,512" --dtype float16 --model-name fast_model
 ```
 
-### Hugging Face Models
+### Download Hugging Face Models
 
-#### Download and convert from model ID
+#### Download from model ID
 ```bash
-python cli.py microsoft/DialoGPT-medium --input-shapes "1,512" --output models/
+python cli.py download microsoft/DialoGPT-medium --output downloads/
 ```
 
 #### Download from full URL
 ```bash
-python cli.py https://huggingface.co/bert-base-uncased --input-shapes "1,512" --verbose
+python cli.py download https://huggingface.co/bert-base-uncased --output downloads/ --verbose
 ```
 
 #### With custom cache directory
 ```bash
-python cli.py openai/gpt-2 --input-shapes "1,1024" --hf-cache-dir ./hf_cache --output converted/
+python cli.py download openai/gpt-2 --hf-cache-dir ./hf_cache --output downloads/
 ```
 
-#### Large language model
+#### Download large model
 ```bash
-python cli.py microsoft/DialoGPT-large --input-shapes "1,1024" --device gpu --dtype float16
+python cli.py download facebook/opt-1.3b --verbose
 ```
 
-### Download Only (No Conversion)
+### Complete Workflows
 
-#### Download model to inspect before conversion
+#### Download then convert workflow
 ```bash
-python cli.py microsoft/DialoGPT-medium --download-only --output downloads/
+# Step 1: Download
+python cli.py download microsoft/DialoGPT-medium --output downloads/
+
+# Step 2: Convert (the CLI will show you the exact command)
+python cli.py convert downloads/pytorch_model.bin --input-shapes "1,512" --output converted/
 ```
 
-#### Download with custom cache
+#### Direct conversion with specific settings
 ```bash
-python cli.py bert-base-uncased --download-only --hf-cache-dir ./my_cache/
-```
-
-#### Download large model to verify it works
-```bash
-python cli.py facebook/opt-1.3b --download-only --verbose
+python cli.py convert model.safetensors --input-shapes "32,1024" --device gpu --dtype float16 --verbose
 ```
 
 ## Output
