@@ -190,19 +190,35 @@ class PyTorchToMAXConverter:
                 graph.output(outputs)
         
         # Load weights if provided or use extracted weights
-        weights_registry = {}
-        
-        # Convert raw numpy arrays to WeightData objects for dlpack compatibility
-        for weight_name, weight_array in self.weight_arrays.items():
-            weights_registry[weight_name] = WeightData.from_numpy(weight_array, weight_name)
-        
         if weights_path:
-            # If external weights provided, update registry
-            external_weights = self._load_pytorch_weights(weights_path)
-            weights_registry.update(external_weights)
+            # If external weights provided, load them properly
+            weights_registry = self._load_pytorch_weights(weights_path)
+            # Add any weights we collected during conversion that aren't in the file
+            for weight_name, weight_array in self.weight_arrays.items():
+                if weight_name not in weights_registry:
+                    weights_registry[weight_name] = WeightData.from_numpy(weight_array, weight_name)
+        else:
+            # Convert raw numpy arrays to WeightData objects for dlpack compatibility
+            weights_registry = {}
+            for weight_name, weight_array in self.weight_arrays.items():
+                weights_registry[weight_name] = WeightData.from_numpy(weight_array, weight_name)
             
         # Compile and return the model
-        return self.session.load(graph, weights_registry=weights_registry)
+        try:
+            return self.session.load(graph, weights_registry=weights_registry)
+        except Exception as e:
+            # Provide helpful error information
+            error_msg = str(e)
+            if "dlpack" in error_msg.lower():
+                print(f"DLPack error details:")
+                print(f"  Number of weights: {len(weights_registry)}")
+                print(f"  Weight types: {set(type(w).__name__ for w in weights_registry.values())}")
+                print(f"  Sample weight names: {list(weights_registry.keys())[:5]}")
+                if weights_path:
+                    print(f"  Using external weights from: {weights_path}")
+                else:
+                    print(f"  Using extracted weights from model")
+            raise
     
     def convert_from_checkpoint(self,
                                model_path: Union[str, Path],
