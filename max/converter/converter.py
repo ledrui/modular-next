@@ -5,6 +5,7 @@ This module provides functionality to convert PyTorch models to MAX graphs
 that can be executed efficiently on MAX runtime.
 """
 
+import sys
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -52,6 +53,7 @@ class PyTorchToMAXConverter:
             nn.Conv2d: self._convert_conv2d,
             nn.ReLU: self._convert_relu,
             nn.GELU: self._convert_gelu,
+            nn.SiLU: self._convert_silu,
             nn.Dropout: self._convert_dropout,
             nn.MultiheadAttention: self._convert_attention,
             nn.Flatten: self._convert_flatten,
@@ -60,10 +62,19 @@ class PyTorchToMAXConverter:
             nn.AvgPool2d: self._convert_avgpool2d,
         }
         
+        # Add custom layer mappings for Llama components
+        # These will be dynamically added when we detect them
+        self._add_llama_layer_mappings()
+        
         # Special case handlers for known model patterns
         self.special_converters = {
             'SimpleTransformer': self._convert_simple_transformer,
             'SimpleResNet': self._convert_simple_resnet,
+            'LlamaModel': self._convert_llama_model,
+            'LlamaForCausalLM': self._convert_llama_for_causal_lm,
+            'LlamaDecoderLayer': self._convert_llama_decoder_layer,
+            'LlamaAttention': self._convert_llama_attention,
+            'LlamaMLP': self._convert_llama_mlp,
         }
         
     def _auto_detect_device(self) -> DeviceRef:
@@ -92,6 +103,41 @@ class PyTorchToMAXConverter:
             # Fallback to CPU-only session
             from max.driver import CPU
             return InferenceSession(devices=[CPU()])
+    
+    def _add_llama_layer_mappings(self):
+        """Add Llama-specific layer mappings dynamically."""
+        try:
+            # Try to import common Llama layer types
+            # These might be from transformers library or custom implementations
+            
+            # Check for RMSNorm (common in Llama implementations)
+            try:
+                from transformers.models.llama.modeling_llama import LlamaRMSNorm
+                self.layer_mappings[LlamaRMSNorm] = self._convert_rmsnorm
+            except ImportError:
+                pass
+            
+            # Check for other common RMSNorm implementations
+            rmsnorm_names = ['RMSNorm', 'LlamaRMSNorm', 'RmsNorm']
+            for name in rmsnorm_names:
+                try:
+                    # Try to find RMSNorm in various modules
+                    for module_name in ['transformers', 'modeling_llama', '__main__']:
+                        try:
+                            if module_name in sys.modules:
+                                module = sys.modules[module_name]
+                                if hasattr(module, name):
+                                    rmsnorm_class = getattr(module, name)
+                                    self.layer_mappings[rmsnorm_class] = self._convert_rmsnorm
+                                    break
+                        except:
+                            continue
+                except:
+                    continue
+                    
+        except Exception as e:
+            # Don't fail if we can't add Llama mappings
+            warnings.warn(f"Could not add some Llama layer mappings: {e}")
     
     def convert_model(self, 
                      pytorch_model: nn.Module,
@@ -541,6 +587,71 @@ class PyTorchToMAXConverter:
         # Layer normalization
         return ops.layer_norm(x.tensor, gamma, beta, epsilon=layer.eps)
     
+    def _convert_rmsnorm(self, layer, inputs, graph) -> Any:
+        """Convert RMSNorm to MAX operations."""
+        # RMSNorm expects a single input tensor
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"RMSNorm expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get epsilon value (different implementations may store this differently)
+        eps = getattr(layer, 'eps', getattr(layer, 'variance_epsilon', 1e-6))
+        
+        # Create Weight object for the scale parameter
+        # RMSNorm typically only has a weight (scale) parameter, no bias
+        weight_name = f"rmsnorm_weight_{id(layer)}"
+        
+        # Try different attribute names for the weight parameter
+        weight_param = None
+        for attr_name in ['weight', 'scale', 'g']:
+            if hasattr(layer, attr_name):
+                weight_param = getattr(layer, attr_name)
+                break
+        
+        if weight_param is None:
+            raise ValueError(f"Could not find weight parameter in RMSNorm layer")
+            
+        weight_array = weight_param.detach().cpu().numpy()
+        # Ensure contiguous memory layout (required by MAX)
+        if not weight_array.flags['C_CONTIGUOUS']:
+            weight_array = weight_array.copy()
+            
+        weight = Weight(
+            name=weight_name,
+            dtype=self.dtype,
+            shape=weight_array.shape,
+            device=self.device
+        )
+        # Store weight data for later loading
+        self.weight_arrays[weight_name] = weight_array
+        scale = graph.add_weight(weight)
+        
+        # RMSNorm: x * scale / sqrt(mean(x^2) + eps)
+        # Check if MAX has native RMSNorm, otherwise implement manually
+        try:
+            return ops.rms_norm(x.tensor, scale, epsilon=eps)
+        except AttributeError:
+            # Fallback: implement RMSNorm manually
+            # 1. Compute x^2
+            x_squared = ops.mul(x.tensor, x.tensor)
+            
+            # 2. Compute mean along last dimension
+            mean_x_squared = ops.mean(x_squared, axis=-1, keepdims=True)
+            
+            # 3. Add epsilon and sqrt
+            eps_const = ops.constant(eps, dtype=self.dtype, device=self.device)
+            variance = ops.add(mean_x_squared, eps_const)
+            rms = ops.sqrt(variance)
+            
+            # 4. Normalize
+            normalized = ops.div(x.tensor, rms)
+            
+            # 5. Scale
+            return ops.mul(normalized, scale)
+    
     def _convert_conv2d(self, layer: nn.Conv2d, inputs, graph) -> Any:
         """Convert nn.Conv2d to MAX operations."""
         if isinstance(inputs, (list, tuple)):
@@ -640,6 +751,25 @@ class PyTorchToMAXConverter:
             return ops.gelu(x.tensor, approximate="tanh")
         else:
             return ops.gelu(x.tensor)
+    
+    def _convert_silu(self, layer: nn.SiLU, inputs, graph) -> Any:
+        """Convert nn.SiLU (Swish) to MAX operations."""
+        # SiLU expects a single input tensor
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"SiLU expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # SiLU(x) = x * sigmoid(x)
+        # Check if MAX has a native SiLU operation, otherwise implement manually
+        try:
+            return ops.silu(x.tensor)
+        except AttributeError:
+            # Fallback: implement SiLU as x * sigmoid(x)
+            sigmoid_x = ops.sigmoid(x.tensor)
+            return ops.mul(x.tensor, sigmoid_x)
     
     def _convert_dropout(self, layer: nn.Dropout, inputs, graph) -> Any:
         """Convert nn.Dropout (passthrough during inference)."""
@@ -1026,6 +1156,139 @@ class PyTorchToMAXConverter:
         
         # Fallback: return input (identity)
         return inputs[0] if isinstance(inputs, (list, tuple)) else inputs
+
+    # Llama-specific conversion methods
+    def _convert_llama_model(self, module, inputs, graph) -> Any:
+        """Convert LlamaModel to MAX operations."""
+        warnings.warn("LlamaModel conversion is experimental")
+        
+        # For now, try generic conversion
+        return self._convert_generic_module(module, inputs, graph)
+    
+    def _convert_llama_for_causal_lm(self, module, inputs, graph) -> Any:
+        """Convert LlamaForCausalLM to MAX operations."""
+        warnings.warn("LlamaForCausalLM conversion is experimental")
+        
+        # LlamaForCausalLM typically has:
+        # - model (LlamaModel)
+        # - lm_head (Linear layer for output projection)
+        
+        x = inputs
+        for name, child in module.named_children():
+            if name == 'model':
+                x = self._convert_module(child, x, graph)
+            elif name == 'lm_head':
+                x = self._convert_module(child, x, graph)
+                
+        return x
+    
+    def _convert_llama_decoder_layer(self, module, inputs, graph) -> Any:
+        """Convert LlamaDecoderLayer to MAX operations."""
+        # LlamaDecoderLayer typically has:
+        # - self_attn (LlamaAttention)
+        # - mlp (LlamaMLP)
+        # - input_layernorm (RMSNorm)
+        # - post_attention_layernorm (RMSNorm)
+        
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"LlamaDecoderLayer expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Store input for residual connection
+        residual = x
+        
+        # Get components
+        input_layernorm = getattr(module, 'input_layernorm', None)
+        self_attn = getattr(module, 'self_attn', None)
+        post_attention_layernorm = getattr(module, 'post_attention_layernorm', None)
+        mlp = getattr(module, 'mlp', None)
+        
+        # Pre-attention normalization
+        if input_layernorm:
+            x = self._convert_module(input_layernorm, x, graph)
+            
+        # Self-attention
+        if self_attn:
+            attn_output = self._convert_module(self_attn, x, graph)
+            # Residual connection
+            x = ops.add(residual.tensor if hasattr(residual, 'tensor') else residual, 
+                       attn_output.tensor if hasattr(attn_output, 'tensor') else attn_output)
+        
+        # Store for next residual
+        residual = x
+        
+        # Pre-MLP normalization
+        if post_attention_layernorm:
+            x = self._convert_module(post_attention_layernorm, x, graph)
+            
+        # MLP
+        if mlp:
+            mlp_output = self._convert_module(mlp, x, graph)
+            # Residual connection
+            x = ops.add(residual.tensor if hasattr(residual, 'tensor') else residual,
+                       mlp_output.tensor if hasattr(mlp_output, 'tensor') else mlp_output)
+            
+        return x
+    
+    def _convert_llama_attention(self, module, inputs, graph) -> Any:
+        """Convert LlamaAttention to MAX operations."""
+        warnings.warn("LlamaAttention conversion is simplified - may not include all features like RoPE")
+        
+        # For now, use the generic multihead attention conversion
+        # In a full implementation, this would handle:
+        # - Grouped query attention
+        # - Rotary position embeddings (RoPE)
+        # - Proper key-value caching
+        
+        return self._convert_attention(module, inputs, graph)
+    
+    def _convert_llama_mlp(self, module, inputs, graph) -> Any:
+        """Convert LlamaMLP (SwiGLU) to MAX operations."""
+        # LlamaMLP typically has:
+        # - gate_proj (Linear)
+        # - up_proj (Linear) 
+        # - down_proj (Linear)
+        # Formula: down_proj(SiLU(gate_proj(x)) * up_proj(x))
+        
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"LlamaMLP expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get components
+        gate_proj = getattr(module, 'gate_proj', None)
+        up_proj = getattr(module, 'up_proj', None)
+        down_proj = getattr(module, 'down_proj', None)
+        
+        if not all([gate_proj, up_proj, down_proj]):
+            warnings.warn("LlamaMLP missing expected components, trying generic conversion")
+            return self._convert_generic_module(module, inputs, graph)
+        
+        # SwiGLU: down_proj(SiLU(gate_proj(x)) * up_proj(x))
+        gate_output = self._convert_linear(gate_proj, x, graph)
+        up_output = self._convert_linear(up_proj, x, graph)
+        
+        # Apply SiLU to gate output
+        # SiLU(x) = x * sigmoid(x)
+        try:
+            gate_activated = ops.silu(gate_output.tensor if hasattr(gate_output, 'tensor') else gate_output)
+        except AttributeError:
+            # Fallback: implement SiLU manually
+            gate_tensor = gate_output.tensor if hasattr(gate_output, 'tensor') else gate_output
+            sigmoid_gate = ops.sigmoid(gate_tensor)
+            gate_activated = ops.mul(gate_tensor, sigmoid_gate)
+        
+        # Element-wise multiplication
+        up_tensor = up_output.tensor if hasattr(up_output, 'tensor') else up_output
+        combined = ops.mul(gate_activated, up_tensor)
+        
+        # Final projection
+        return self._convert_linear(down_proj, combined, graph)
 
 
 # Convenience functions
