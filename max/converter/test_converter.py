@@ -63,10 +63,56 @@ def create_test_models():
     
     transformer = SimpleTransformer()
     
+    # Simplified ResNet model
+    class SimpleResNet(nn.Module):
+        def __init__(self, num_classes=10):
+            super().__init__()
+            # Initial convolution
+            self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            self.bn1 = nn.BatchNorm2d(64)
+            self.relu = nn.ReLU(inplace=True)
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            
+            # Simplified residual block (without skip connections for now)
+            self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn2 = nn.BatchNorm2d(64)
+            self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False)
+            self.bn3 = nn.BatchNorm2d(128)
+            
+            # Global average pooling and classifier
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(128, num_classes)
+            
+        def forward(self, x):
+            # Initial conv block
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.relu(x)
+            x = self.maxpool(x)
+            
+            # Simplified residual blocks (without skip connections)
+            x = self.conv2(x)
+            x = self.bn2(x)
+            x = self.relu(x)
+            
+            x = self.conv3(x)
+            x = self.bn3(x)
+            x = self.relu(x)
+            
+            # Global average pooling and classifier
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.fc(x)
+            
+            return x
+    
+    resnet = SimpleResNet()
+    
     return {
         'mlp': (mlp, [(1, 784)]),
         'cnn': (cnn, [(1, 1, 28, 28)]),
-        'transformer': (transformer, [(1, 32)])  # batch_size=1, seq_len=32
+        'transformer': (transformer, [(1, 32)]),  # batch_size=1, seq_len=32
+        'resnet': (resnet, [(1, 3, 224, 224)]),  # batch_size=1, 3 channels, 224x224 image
     }
 
 

@@ -48,12 +48,16 @@ class PyTorchToMAXConverter:
             nn.Linear: self._convert_linear,
             nn.Embedding: self._convert_embedding,
             nn.LayerNorm: self._convert_layernorm,
+            nn.BatchNorm2d: self._convert_batchnorm2d,
             nn.Conv2d: self._convert_conv2d,
             nn.ReLU: self._convert_relu,
             nn.GELU: self._convert_gelu,
             nn.Dropout: self._convert_dropout,
             nn.MultiheadAttention: self._convert_attention,
             nn.Flatten: self._convert_flatten,
+            nn.MaxPool2d: self._convert_maxpool2d,
+            nn.AdaptiveAvgPool2d: self._convert_adaptive_avgpool2d,
+            nn.AvgPool2d: self._convert_avgpool2d,
         }
         
         # Special case handlers for known model patterns
@@ -573,6 +577,251 @@ class PyTorchToMAXConverter:
         # In a full implementation, you'd implement the full attention mechanism
         return query
     
+    def _convert_batchnorm2d(self, layer: nn.BatchNorm2d, inputs, graph) -> Any:
+        """Convert nn.BatchNorm2d to MAX operations."""
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"BatchNorm2d expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Convert input from NCHW to NHWC format (matching conv2d)
+        x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+        
+        # Create Weight objects for batch norm parameters
+        weight_name = f"batchnorm_weight_{id(layer)}"
+        weight_array = layer.weight.detach().cpu().numpy()
+        if not weight_array.flags['C_CONTIGUOUS']:
+            weight_array = weight_array.copy()
+        
+        weight_obj = Weight(
+            name=weight_name,
+            dtype=self.dtype,
+            shape=weight_array.shape,
+            device=self.device
+        )
+        self.weight_arrays[weight_name] = weight_array
+        gamma = graph.add_weight(weight_obj)
+        
+        bias_name = f"batchnorm_bias_{id(layer)}"
+        bias_array = layer.bias.detach().cpu().numpy()
+        if not bias_array.flags['C_CONTIGUOUS']:
+            bias_array = bias_array.copy()
+        
+        bias_obj = Weight(
+            name=bias_name,
+            dtype=self.dtype,
+            shape=bias_array.shape,
+            device=self.device
+        )
+        self.weight_arrays[bias_name] = bias_array
+        beta = graph.add_weight(bias_obj)
+        
+        # Running mean and variance
+        mean_name = f"batchnorm_mean_{id(layer)}"
+        mean_array = layer.running_mean.detach().cpu().numpy()
+        if not mean_array.flags['C_CONTIGUOUS']:
+            mean_array = mean_array.copy()
+        
+        mean_obj = Weight(
+            name=mean_name,
+            dtype=self.dtype,
+            shape=mean_array.shape,
+            device=self.device
+        )
+        self.weight_arrays[mean_name] = mean_array
+        running_mean = graph.add_weight(mean_obj)
+        
+        var_name = f"batchnorm_var_{id(layer)}"
+        var_array = layer.running_var.detach().cpu().numpy()
+        if not var_array.flags['C_CONTIGUOUS']:
+            var_array = var_array.copy()
+        
+        var_obj = Weight(
+            name=var_name,
+            dtype=self.dtype,
+            shape=var_array.shape,
+            device=self.device
+        )
+        self.weight_arrays[var_name] = var_array
+        running_var = graph.add_weight(var_obj)
+        
+        # Batch normalization: (x - mean) / sqrt(var + eps) * gamma + beta
+        # For inference, use running statistics
+        eps_const = ops.constant(layer.eps, self.dtype, self.device)
+        
+        # Broadcast running stats to match input shape
+        # Input is NHWC, so we need to broadcast along spatial dimensions
+        mean_bc = ops.unsqueeze(ops.unsqueeze(running_mean, 0), 0)  # [1, 1, C]
+        var_bc = ops.unsqueeze(ops.unsqueeze(running_var, 0), 0)    # [1, 1, C]
+        gamma_bc = ops.unsqueeze(ops.unsqueeze(gamma, 0), 0)        # [1, 1, C]
+        beta_bc = ops.unsqueeze(ops.unsqueeze(beta, 0), 0)          # [1, 1, C]
+        
+        # Normalize
+        x_norm = ops.sub(x_nhwc, mean_bc)
+        var_eps = ops.add(var_bc, eps_const)
+        std = ops.sqrt(var_eps)
+        x_norm = ops.div(x_norm, std)
+        
+        # Scale and shift
+        output = ops.mul(x_norm, gamma_bc)
+        output = ops.add(output, beta_bc)
+        
+        # Convert back to NCHW
+        output = ops.permute(output, [0, 3, 1, 2])  # NHWC -> NCHW
+        
+        return output
+    
+    def _convert_maxpool2d(self, layer: nn.MaxPool2d, inputs, graph) -> Any:
+        """Convert nn.MaxPool2d to MAX operations."""
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"MaxPool2d expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Convert input from NCHW to NHWC format
+        x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+        
+        # Get pooling parameters
+        if isinstance(layer.kernel_size, int):
+            kernel_size = (layer.kernel_size, layer.kernel_size)
+        else:
+            kernel_size = layer.kernel_size
+            
+        if isinstance(layer.stride, int):
+            stride = (layer.stride, layer.stride)
+        elif layer.stride is None:
+            stride = kernel_size
+        else:
+            stride = layer.stride
+            
+        if isinstance(layer.padding, int):
+            padding = (layer.padding, layer.padding)
+        else:
+            padding = layer.padding
+        
+        # Max pooling operation
+        output = ops.max_pool2d(
+            x_nhwc,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding
+        )
+        
+        # Convert back to NCHW
+        output = ops.permute(output, [0, 3, 1, 2])  # NHWC -> NCHW
+        
+        return output
+    
+    def _convert_avgpool2d(self, layer: nn.AvgPool2d, inputs, graph) -> Any:
+        """Convert nn.AvgPool2d to MAX operations."""
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"AvgPool2d expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Convert input from NCHW to NHWC format
+        x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+        
+        # Get pooling parameters
+        if isinstance(layer.kernel_size, int):
+            kernel_size = (layer.kernel_size, layer.kernel_size)
+        else:
+            kernel_size = layer.kernel_size
+            
+        if isinstance(layer.stride, int):
+            stride = (layer.stride, layer.stride)
+        elif layer.stride is None:
+            stride = kernel_size
+        else:
+            stride = layer.stride
+            
+        if isinstance(layer.padding, int):
+            padding = (layer.padding, layer.padding)
+        else:
+            padding = layer.padding
+        
+        # Average pooling operation
+        output = ops.avg_pool2d(
+            x_nhwc,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding
+        )
+        
+        # Convert back to NCHW
+        output = ops.permute(output, [0, 3, 1, 2])  # NHWC -> NCHW
+        
+        return output
+    
+    def _convert_adaptive_avgpool2d(self, layer: nn.AdaptiveAvgPool2d, inputs, graph) -> Any:
+        """Convert nn.AdaptiveAvgPool2d to MAX operations."""
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"AdaptiveAvgPool2d expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get output size
+        output_size = layer.output_size
+        if isinstance(output_size, int):
+            output_size = (output_size, output_size)
+        
+        # For AdaptiveAvgPool2d with output size (1, 1), use global average pooling
+        if output_size == (1, 1):
+            # Convert input from NCHW to NHWC format
+            x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+            
+            # Global average pooling: mean over spatial dimensions (H, W)
+            # Input: [batch, height, width, channels]
+            # We want to average over dimensions 1 and 2 (height and width)
+            
+            # Mean over height dimension (axis=1)
+            x_h_mean = ops.mean(x_nhwc, axis=1)  # [batch, width, channels]
+            # Mean over width dimension (axis=1, since height was already reduced)
+            x_hw_mean = ops.mean(x_h_mean, axis=1)  # [batch, channels]
+            
+            # Reshape to [batch, channels, 1, 1] to match PyTorch output
+            output = ops.unsqueeze(ops.unsqueeze(x_hw_mean, -1), -1)  # [batch, channels, 1, 1]
+            
+            return output
+        else:
+            # For other output sizes, fall back to a simplified approach
+            warnings.warn(f"AdaptiveAvgPool2d with output_size {output_size} uses simplified conversion")
+            
+            # Calculate approximate kernel size and stride based on input/output ratio
+            input_shape = x.tensor.shape
+            if len(input_shape) == 4:  # [batch, channels, height, width]
+                input_h, input_w = input_shape[2], input_shape[3]
+                output_h, output_w = output_size
+                
+                kernel_h = input_h // output_h
+                kernel_w = input_w // output_w
+                stride_h = kernel_h
+                stride_w = kernel_w
+                
+                # Use regular average pooling as approximation
+                x_nhwc = ops.permute(x.tensor, [0, 2, 3, 1])  # NCHW -> NHWC
+                output = ops.avg_pool2d(
+                    x_nhwc,
+                    kernel_size=(kernel_h, kernel_w),
+                    stride=(stride_h, stride_w),
+                    padding=(0, 0)
+                )
+                output = ops.permute(output, [0, 3, 1, 2])  # NHWC -> NCHW
+                
+                return output
+            else:
+                raise ValueError(f"Unexpected input shape for AdaptiveAvgPool2d: {input_shape}")
+    
+    # The rest of the existing methods continue unchanged...
+    
     def _load_pytorch_weights(self, weights_path: Union[str, Path]) -> Dict[str, Any]:
         """Load PyTorch weights from file."""
         weights_path = Path(weights_path)
@@ -698,9 +947,3 @@ if __name__ == "__main__":
     print(f"Input devices: {max_model.input_devices}")
     print(f"Output devices: {max_model.output_devices}")
     
-    # Example 2: Convert from checkpoint
-    # max_model = convert_from_checkpoint(
-    #     model_path="path/to/model.pt",
-    #     input_shapes=[(1, 3, 224, 224)],  # Batch, channels, height, width
-    #     model_name="resnet_converted"
-    # )
