@@ -68,7 +68,7 @@ max_model = converter.convert_model(
 Run a basic test to verify the converter works:
 
 ```bash
-python quick_test.py
+pixi run python quick_test.py
 ```
 
 This creates a simple MLP, converts it to MAX, and compares inference results.
@@ -78,7 +78,7 @@ This creates a simple MLP, converts it to MAX, and compares inference results.
 Run comprehensive tests with multiple model types:
 
 ```bash
-python test_converter.py
+pixi run python test_converter.py
 ```
 
 Tests include:
@@ -95,7 +95,7 @@ Tests include:
 See real-world usage scenarios:
 
 ```bash
-python example_usage.py
+pixi run python example_usage.py
 ```
 
 Examples include:
