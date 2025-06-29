@@ -63,6 +63,7 @@ class PyTorchToMAXConverter:
         # Special case handlers for known model patterns
         self.special_converters = {
             'SimpleTransformer': self._convert_simple_transformer,
+            'SimpleResNet': self._convert_simple_resnet,
         }
         
     def _auto_detect_device(self) -> DeviceRef:
@@ -248,11 +249,40 @@ class PyTorchToMAXConverter:
             # to trace the forward pass or have more sophisticated analysis
             warnings.warn(f"Generic conversion for {type(module)} may not be accurate")
             
-        # Try to convert known child modules
+        # Try to convert known child modules with smart shape handling
         x = inputs
-        for name, child in module.named_children():
+        child_modules = list(module.named_children())
+        
+        for i, (name, child) in enumerate(child_modules):
             if hasattr(child, 'forward'):
+                prev_x = x
                 x = self._convert_module(child, x, graph)
+                
+                # Check if we need to insert a flatten operation
+                # This handles the common pattern where conv layers are followed by linear layers
+                if i < len(child_modules) - 1:  # Not the last child
+                    next_name, next_child = child_modules[i + 1]
+                    
+                    # If current output is 4D (from conv/pool) and next module is Linear
+                    if (isinstance(child, (nn.Conv2d, nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d)) and 
+                        isinstance(next_child, nn.Linear)):
+                        
+                        # Insert flatten operation
+                        if isinstance(x, (list, tuple)):
+                            if len(x) == 1:
+                                x_tensor = x[0]
+                            else:
+                                raise ValueError(f"Expected single tensor before flatten, got {len(x)}")
+                        else:
+                            x_tensor = x
+                            
+                        # Check if we have a 4D tensor that needs flattening
+                        if hasattr(x_tensor, 'tensor') and hasattr(x_tensor.tensor, 'shape'):
+                            tensor_shape = x_tensor.tensor.shape
+                            if len(tensor_shape) == 4:  # [batch, channels, height, width]
+                                # Flatten to [batch, channels * height * width]
+                                x = ops.flatten(x_tensor.tensor, start_dim=1)
+                                
         return x
     
     def _convert_simple_transformer(self, module: nn.Module, inputs, graph) -> Any:
@@ -298,6 +328,85 @@ class PyTorchToMAXConverter:
         x_squeezed = ops.squeeze(x_mean, axis=-1)  # Remove the singleton dim -> (batch, embed_dim)
         
         x = self._convert_linear(linear, x_squeezed, graph)
+        
+        return x
+    
+    def _convert_simple_resnet(self, module: nn.Module, inputs, graph) -> Any:
+        """Convert SimpleResNet module with proper conv-to-linear transition."""
+        # Handle the SimpleResNet forward pass:
+        # x = self.pool1(self.relu1(self.conv1(x)))
+        # x = self.pool2(self.relu2(self.conv2(x)))  
+        # x = self.pool3(self.relu3(self.conv3(x)))
+        # x = x.view(x.size(0), -1)  # Flatten
+        # x = self.relu4(self.fc1(x))
+        # x = self.fc2(x)
+        
+        if isinstance(inputs, (list, tuple)):
+            if len(inputs) != 1:
+                raise ValueError(f"SimpleResNet expects 1 input, got {len(inputs)}")
+            x = inputs[0]
+        else:
+            x = inputs
+            
+        # Get the child modules in the expected order
+        conv1 = relu1 = pool1 = None
+        conv2 = relu2 = pool2 = None  
+        conv3 = relu3 = pool3 = None
+        fc1 = relu4 = fc2 = None
+        
+        for name, child in module.named_children():
+            if name == 'conv1':
+                conv1 = child
+            elif name == 'relu1':
+                relu1 = child
+            elif name == 'pool1':
+                pool1 = child
+            elif name == 'conv2':
+                conv2 = child
+            elif name == 'relu2':
+                relu2 = child
+            elif name == 'pool2':
+                pool2 = child
+            elif name == 'conv3':
+                conv3 = child
+            elif name == 'relu3':
+                relu3 = child
+            elif name == 'pool3':
+                pool3 = child
+            elif name == 'fc1':
+                fc1 = child
+            elif name == 'relu4':
+                relu4 = child
+            elif name == 'fc2':
+                fc2 = child
+                
+        # Apply the conv blocks in sequence
+        if all([conv1, relu1, pool1]):
+            x = self._convert_conv2d(conv1, x, graph)
+            x = self._convert_relu(relu1, x, graph)
+            x = self._convert_maxpool2d(pool1, x, graph)
+        
+        if all([conv2, relu2, pool2]):
+            x = self._convert_conv2d(conv2, x, graph)
+            x = self._convert_relu(relu2, x, graph)
+            x = self._convert_maxpool2d(pool2, x, graph)
+            
+        if all([conv3, relu3, pool3]):
+            x = self._convert_conv2d(conv3, x, graph)
+            x = self._convert_relu(relu3, x, graph)
+            x = self._convert_maxpool2d(pool3, x, graph)
+        
+        # Flatten before linear layers (equivalent to x.view(x.size(0), -1))
+        if hasattr(x, 'tensor'):
+            x_flattened = ops.flatten(x.tensor, start_dim=1)
+        else:
+            x_flattened = ops.flatten(x, start_dim=1)
+        
+        # Apply the linear layers
+        if fc1 and relu4 and fc2:
+            x = self._convert_linear(fc1, x_flattened, graph)
+            x = self._convert_relu(relu4, x, graph)
+            x = self._convert_linear(fc2, x, graph)
         
         return x
     
