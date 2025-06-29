@@ -5,6 +5,8 @@ Command-line interface for PyTorch to MAX converter.
 Usage:
     python cli.py /path/to/model.pt --output /path/to/output/
     python cli.py /path/to/model.pth --output models/
+    python cli.py microsoft/DialoGPT-medium --input-shapes "1,512" --output models/
+    python cli.py https://huggingface.co/bert-base-uncased --input-shapes "1,512" --output models/
 """
 
 import argparse
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 from converter import convert_from_checkpoint
+from huggingface_utils import is_huggingface_url, extract_model_id_from_url, download_hf_model, get_model_info
 from max.dtype import DType
 from max.graph import DeviceRef
 
@@ -42,13 +45,15 @@ Examples:
   python cli.py model.pt --input-shapes "1,784" --output models/
   python cli.py model.pth --input-shapes "1,3,224,224" --output converted/
   python cli.py checkpoint.pt --input-shapes "32,512" --device gpu --dtype float16
+  python cli.py microsoft/DialoGPT-medium --input-shapes "1,512" --output models/
+  python cli.py https://huggingface.co/bert-base-uncased --input-shapes "1,512" --output models/
         """
     )
     
     parser.add_argument(
         "model_path",
         type=str,
-        help="Path to PyTorch model file (.pt, .pth, .safetensors)"
+        help="Path to PyTorch model file (.pt, .pth, .safetensors) or Hugging Face model URL/ID"
     )
     
     parser.add_argument(
@@ -93,18 +98,47 @@ Examples:
         help="Enable verbose output"
     )
     
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=str,
+        help="Cache directory for Hugging Face models (default: system temp directory)"
+    )
+    
     args = parser.parse_args()
     
-    # Validate input file
-    model_path = Path(args.model_path)
-    if not model_path.exists():
-        print(f"Error: Model file not found: {model_path}")
-        sys.exit(1)
+    # Handle Hugging Face URLs/IDs vs local files
+    if is_huggingface_url(args.model_path):
+        # Handle Hugging Face model
+        model_id = extract_model_id_from_url(args.model_path)
+        
+        if args.verbose:
+            print(f"Detected Hugging Face model: {model_id}")
+            # Get model info if possible
+            model_info = get_model_info(model_id)
+            if "error" not in model_info:
+                print(f"Model info: {model_info}")
+            print()
+        
+        try:
+            # Download the model
+            print(f"Downloading model from Hugging Face: {model_id}")
+            model_path = download_hf_model(model_id, cache_dir=args.hf_cache_dir)
+            print(f"Model downloaded to: {model_path}")
+        except Exception as e:
+            print(f"❌ Failed to download model: {e}")
+            sys.exit(1)
     
-    if model_path.suffix not in ['.pt', '.pth', '.safetensors']:
-        print(f"Error: Unsupported file format: {model_path.suffix}")
-        print("Supported formats: .pt, .pth, .safetensors")
-        sys.exit(1)
+    else:
+        # Handle local file
+        model_path = Path(args.model_path)
+        if not model_path.exists():
+            print(f"Error: Model file not found: {model_path}")
+            sys.exit(1)
+        
+        if model_path.suffix not in ['.pt', '.pth', '.safetensors']:
+            print(f"Error: Unsupported file format: {model_path.suffix}")
+            print("Supported formats: .pt, .pth, .safetensors")
+            sys.exit(1)
     
     # Create output directory
     output_dir = Path(args.output)
@@ -137,7 +171,14 @@ Examples:
     dtype = dtype_map[args.dtype]
     
     # Generate model name
-    model_name = args.model_name or model_path.stem
+    if args.model_name:
+        model_name = args.model_name
+    elif is_huggingface_url(args.model_path):
+        # For HF models, use the model ID as base name
+        model_id = extract_model_id_from_url(args.model_path)
+        model_name = model_id.replace('/', '_').replace('-', '_')
+    else:
+        model_name = model_path.stem
     
     if args.verbose:
         print(f"Converting model: {model_path}")
@@ -170,7 +211,13 @@ Examples:
         model_info_path = output_dir / f"{model_name}_info.txt"
         with open(model_info_path, 'w') as f:
             f.write(f"Model: {model_name}\n")
-            f.write(f"Source: {model_path}\n")
+            if is_huggingface_url(args.model_path):
+                model_id = extract_model_id_from_url(args.model_path)
+                f.write(f"Hugging Face ID: {model_id}\n")
+                f.write(f"Original Input: {args.model_path}\n")
+                f.write(f"Downloaded to: {model_path}\n")
+            else:
+                f.write(f"Source: {model_path}\n")
             f.write(f"Input shapes: {input_shapes}\n")
             f.write(f"Device: {args.device}\n")
             f.write(f"Data type: {args.dtype}\n")
