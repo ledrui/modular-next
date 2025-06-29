@@ -41,12 +41,21 @@ def main():
         description="Convert PyTorch models to MAX format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python cli.py model.pt --input-shapes "1,784" --output models/
-  python cli.py model.pth --input-shapes "1,3,224,224" --output converted/
-  python cli.py checkpoint.pt --input-shapes "32,512" --device gpu --dtype float16
-  python cli.py microsoft/DialoGPT-medium --input-shapes "1,512" --output models/
-  python cli.py https://huggingface.co/bert-base-uncased --input-shapes "1,512" --output models/
+        Examples:
+        # Convert local models
+        python cli.py model.pt --input-shapes "1,784" --output models/
+        python cli.py model.pth --input-shapes "1,3,224,224" --output converted/
+        
+        # Download and convert HF models
+        python cli.py microsoft/DialoGPT-medium --input-shapes "1,512" --output models/
+        python cli.py https://huggingface.co/bert-base-uncased --input-shapes "1,512" --output models/
+        
+        # Download only (no conversion) - useful for debugging download issues
+        python cli.py microsoft/DialoGPT-medium --download-only --output downloads/
+        python cli.py bert-base-uncased --download-only
+        
+        # Use verbose mode for detailed debugging information
+        python cli.py bert-base-uncased --input-shapes "1,512" --output models/ --verbose
         """
     )
     
@@ -66,8 +75,13 @@ Examples:
     parser.add_argument(
         "--input-shapes",
         type=str,
-        required=True,
-        help="Input tensor shapes in format 'batch,dim1,dim2,...' or 'batch,dim1;batch,dim2' for multiple inputs"
+        help="Input tensor shapes in format 'batch,dim1,dim2,...' or 'batch,dim1;batch,dim2' for multiple inputs (required for conversion)"
+    )
+    
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Only download the model without converting (for HF models). Useful for debugging download issues or inspecting model files before conversion."
     )
     
     parser.add_argument(
@@ -124,6 +138,12 @@ Examples:
             print(f"Downloading model from Hugging Face: {model_id}")
             model_path = download_hf_model(model_id, cache_dir=args.hf_cache_dir)
             print(f"Model downloaded to: {model_path}")
+            
+            # If download-only is specified, exit after successful download
+            if args.download_only:
+                print(f"✅ Download completed! Model saved to: {model_path}")
+                sys.exit(0)
+                
         except Exception as e:
             print(f"❌ Failed to download model: {e}")
             sys.exit(1)
@@ -144,7 +164,12 @@ Examples:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Parse input shapes
+    # Parse input shapes (required for conversion, not for download-only)
+    if not args.input_shapes:
+        print("Error: --input-shapes is required for model conversion")
+        print("Format: 'batch,dim1,dim2,...' or 'batch,dim1;batch,dim2' for multiple inputs")
+        sys.exit(1)
+    
     try:
         input_shapes = parse_input_shapes(args.input_shapes)
     except ValueError as e:
@@ -193,6 +218,9 @@ Examples:
         # Convert the model
         if args.verbose:
             print("Starting conversion...")
+            print(f"Model file: {model_path}")
+            print(f"File size: {model_path.stat().st_size / (1024*1024):.1f} MB")
+            print(f"File extension: {model_path.suffix}")
         
         max_model = convert_from_checkpoint(
             model_path=model_path,
@@ -232,6 +260,20 @@ Examples:
         if args.verbose:
             import traceback
             traceback.print_exc()
+            print(f"\nDebugging info:")
+            print(f"Model path: {model_path}")
+            print(f"File exists: {model_path.exists()}")
+            if model_path.exists():
+                print(f"File size: {model_path.stat().st_size} bytes")
+                print(f"File extension: {model_path.suffix}")
+        
+        # Suggest alternatives for common issues
+        if "PytorchStreamReader failed reading zip archive" in str(e):
+            print("\n💡 Suggestion: This error often occurs with corrupted downloads or incompatible file formats.")
+            print("   Try using the --download-only flag first to verify the download, then convert manually.")
+            if is_huggingface_url(args.model_path):
+                print(f"   You can also try downloading different format files for this model.")
+        
         sys.exit(1)
 
 

@@ -120,11 +120,11 @@ def download_hf_model(model_id: str, cache_dir: Optional[Union[str, Path]] = Non
     
     # Look for PyTorch model files (in order of preference)
     model_file_candidates = [
-        "pytorch_model.bin",
         "model.safetensors", 
         "pytorch_model.safetensors",
         "model.pt",
-        "model.pth"
+        "model.pth",
+        "pytorch_model.bin",
     ]
     
     model_file = None
